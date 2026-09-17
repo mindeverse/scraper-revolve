@@ -1,0 +1,160 @@
+name: Scrape REVOLVE
+
+on:
+  schedule:
+    # Famous aggregator — 3×/week Tue/Thu/Sat 08:23 UTC (staggered vs ASOS)
+    - cron: '23 8 * * 2,4,6'
+  workflow_dispatch:
+    inputs:
+      embed_chunks:
+        description: 'Number of parallel embed runners'
+        required: false
+        default: '30'
+        type: string
+
+env:
+  EMBED_CHUNKS: ${{ inputs.embed_chunks || '30' }}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Huge catalog — allow up to 90m for category pagination
+    timeout-minutes: 120
+    outputs:
+      total_products: ${{ steps.scrape.outputs.total_products }}
+      to_embed: ${{ steps.scrape.outputs.to_embed }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-siglip-base-patch16-384
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Scrape products
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python main.py --mode scrape
+
+      - name: Read scrape output
+        id: scrape
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('logs/scrape_output.json'))
+          total = d.get('scraped_count') or len(d.get('scraped_urls') or d.get('scraped') or [])
+          print(f'total_products={total}')
+          print(f'to_embed={len(d[\"to_embed\"])}')
+          " | tee /tmp/scrape_out.txt
+          echo "total_products=$(grep total_products /tmp/scrape_out.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "to_embed=$(grep to_embed /tmp/scrape_out.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
+
+      - name: Upload scrape output
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-output
+          path: logs/scrape_output.json
+          retention-days: 1
+
+  embed:
+    needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        chunk: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-siglip-base-patch16-384
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download scrape output
+        uses: actions/download-artifact@v4
+        with:
+          name: scrape-output
+          path: logs/
+
+      - name: Run embed chunk
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python main.py --mode embed --chunk ${{ matrix.chunk }} --total-chunks ${{ env.EMBED_CHUNKS }}
+
+      - name: Upload chunk summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk }}-summary
+          path: logs/chunk${{ matrix.chunk }}_summary.json
+          if-no-files-found: ignore
+
+  log-results:
+    needs: [scrape, embed]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all chunk summaries
+        uses: actions/download-artifact@v4
+        with:
+          path: summaries/
+
+      - name: Merge summaries
+        run: |
+          echo "=== Scrape Summary ==="
+          echo "Total products: ${{ needs.scrape.outputs.total_products }}"
+          echo "To embed: ${{ needs.scrape.outputs.to_embed }}"
+          echo ""
+          echo "=== Chunk Results ==="
+          for f in summaries/chunk-*-summary/chunk*_summary.json; do
+            if [ -f "$f" ]; then
+              echo "--- $(basename $f) ---"
+              python3 -c "import json; d=json.load(open('$f')); [print(f'  {k}: {v}') for k,v in d.items()]"
+            fi
+          done
+
+      - name: Upload run summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-summary
+          path: summaries/
+          if-no-files-found: ignore
+
+      - name: Upload failed products log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-products-log
+          path: logs/failed_products.log
+          if-no-files-found: ignore
